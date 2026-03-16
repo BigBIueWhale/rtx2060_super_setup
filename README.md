@@ -105,10 +105,10 @@ The "CUDA Version: 12.8" field in the `nvidia-smi` output indicates the maximum 
 
 The NVIDIA CUDA Toolkit provides the CUDA compiler (`nvcc`), CUDA runtime libraries, and development headers needed for GPU-accelerated applications and AI inference frameworks.
 
-**Script:** `~/setup/install_cuda_toolkit.sh`
+**Script:** [`install_cuda_toolkit.sh`](./install_cuda_toolkit.sh)
 
 ```bash
-sudo bash ~/setup/install_cuda_toolkit.sh
+sudo bash install_cuda_toolkit.sh
 ```
 
 ### What the script does
@@ -137,14 +137,14 @@ Cuda compilation tools, release 12.8, V12.8.93
 
 ## Step 3: Install Docker Engine
 
-Docker Engine is the container runtime used to run AI applications (such as Open WebUI) in isolated containers with GPU access.
+Docker Engine is the container runtime used to run GPU-accelerated applications in isolated containers.
 
 The installation follows the official Docker documentation at `https://docs.docker.com/engine/install/ubuntu/`.
 
-**Script:** `~/setup/install_docker.sh`
+**Script:** [`install_docker.sh`](./install_docker.sh)
 
 ```bash
-sudo bash ~/setup/install_docker.sh
+sudo bash install_docker.sh
 ```
 
 ### What the script does
@@ -180,10 +180,10 @@ docker --version
 
 The NVIDIA Container Toolkit enables Docker containers to access the host's NVIDIA GPU. Without it, the `--gpus` flag in `docker run` does not work.
 
-**Script:** `~/setup/install_nvidia_container_toolkit.sh`
+**Script:** [`install_nvidia_container_toolkit.sh`](./install_nvidia_container_toolkit.sh)
 
 ```bash
-sudo bash ~/setup/install_nvidia_container_toolkit.sh
+sudo bash install_nvidia_container_toolkit.sh
 ```
 
 ### What the script does
@@ -210,6 +210,38 @@ NVIDIA GeForce RTX 2060 SUPER    8192MiB
 
 ---
 
+## Step 5: Enable Systemd User Lingering
+
+By default, systemd user services (services managed via `systemctl --user`) only run while the user has an active login session. On a headless server where no one is logged in at the physical console, this means user services would not start at boot.
+
+**Lingering** tells systemd to start the user's service manager at boot, regardless of whether the user has logged in. This is the standard mechanism for running user services on headless servers — no auto-login or physical console session required.
+
+```bash
+sudo loginctl enable-linger user
+```
+
+### Verification
+
+```bash
+loginctl show-user user --property=Linger
+```
+
+Expected output:
+
+```
+Linger=yes
+```
+
+After enabling lingering, any user service with `WantedBy=default.target` in its `[Install]` section will start automatically at boot. This is required for the [Qwen 3.5 9B llama.cpp inference server](./qwen3_5_server/README.md) to run unattended.
+
+### Disabling lingering (if ever needed)
+
+```bash
+sudo loginctl disable-linger user
+```
+
+---
+
 ## Final State After Setup
 
 | Component | Version / Status |
@@ -219,10 +251,8 @@ NVIDIA GeForce RTX 2060 SUPER    8192MiB
 | Docker Engine | Community Edition (from official Docker APT repository) |
 | NVIDIA Container Toolkit | Installed from `nvidia.github.io` APT repository |
 | GPU in Docker | Verified working via `docker run --gpus all` |
+| Systemd User Lingering | Enabled for user `user` |
 
 ## What Comes Next
 
-The following steps from the `personal_server` repository have not yet been completed:
-
-- **Ollama** — Local large language model inference server (section 10 of `personal_server/README.md`)
-- **Open WebUI** — Web-based chat frontend for Ollama (section 9 of `personal_server/README.md`)
+- **[Qwen 3.5 9B Inference Server](./qwen3_5_server/README.md)** — Local large language model inference via llama.cpp, running as a systemd user service with OpenAI-compatible API on `127.0.0.1:8080`. Includes tool calling, thinking mode, and sampling parameters tuned for agentic coding flows.

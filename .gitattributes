@@ -1,0 +1,8 @@
+# Force LF line endings for all text files
+* text=auto eol=lf
+
+# Explicitly mark shell scripts as text with LF endings
+*.sh text eol=lf
+
+# Mark markdown as text
+*.md text eol=lf

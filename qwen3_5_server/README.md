@@ -101,21 +101,19 @@ Per layer per token: 4 KV-heads x 256 head_dim x 2 (K + V) = 2,048 elements
 8 layers total: 2,048 x 8 = 16,384 elements per token
 ```
 
-| KV Cache Quantization | Bytes per Element | Bytes per Token | Max Context (in ~1,872 MB) |
+| KV Cache Type | Bytes per Element | Bytes per Token (8 layers) | Max Context (in ~1,872 MB) |
 |---|---|---|---|
-| FP16 (default) | 2.0 | 32,768 (~32 KB) | ~59,900 tokens |
-| **Q8_0 (chosen)** | **1.0625** | **17,408 (~17 KB)** | **~112,800 tokens** |
-| Q4_0 (not recommended) | 0.5625 | 9,216 (~9 KB) | ~213,300 tokens |
+| **FP16 (chosen)** | **2.0** | **32,768 (~32 KB)** | **~59,900 tokens** |
+| Q8_0 | 1.0625 | 17,408 (~17 KB) | ~112,800 tokens |
+| Q4_0 | 0.5625 | 9,216 (~9 KB) | ~213,300 tokens |
 
-Q4_0 is not used because the llama.cpp documentation explicitly warns: *"Beware of extreme KV quantizations (e.g. `-ctk q4_0`), they can substantially degrade the model's tool calling performance."*
+**KV cache quantization is not used.** Quantizing the KV cache (Q8_0 or Q4_0) yields unacceptable quality and stability decreases for long agentic coding flows. The llama.cpp documentation itself warns about degraded tool calling performance with quantized KV caches. FP16 is the only acceptable option for production use.
 
-### Chosen Context Size: 49,152 tokens (48K)
+### Chosen Context Size: 55,296 tokens (54K)
 
-With Q8_0 KV cache, 49,152 tokens uses approximately **836 MB** of the available ~1,872 MB, leaving over **1 GB of headroom** for batch processing buffers, flash attention workspace, and other runtime allocations. This is a deliberately conservative choice for long-running stability.
+With FP16 KV cache, 55,296 tokens uses approximately **1,728 MB** of the available ~1,872 MB, leaving ~**144 MB** for batch processing buffers, flash attention workspace, and other runtime allocations. This uses nearly the full 8,192 MiB of VRAM on the RTX 2060 SUPER.
 
-The theoretical maximum with Q8_0 is ~112K tokens, but running at the edge of VRAM risks OOM during batch processing or when multiple requests are queued. For a service that must run unsupervised for long agentic flows, reliability matters more than maximum context.
-
-**Note:** The Qwen 3.5 model card recommends a minimum of 128K context "to preserve thinking capabilities." This is not achievable on 8 GB VRAM with the 9B model. The 48K context is a hardware-imposed trade-off. Thinking mode still works at 48K — the recommendation is about quality at the upper end of deep reasoning chains, not a hard functional requirement.
+**Note:** The Qwen 3.5 model card recommends a minimum of 128K context "to preserve thinking capabilities." This is not achievable on 8 GB VRAM with the 9B model at FP16 KV cache. The 54K context is a hardware-imposed trade-off. Thinking mode still works at 54K — the recommendation is about quality at the upper end of deep reasoning chains, not a hard functional requirement.
 
 ---
 
@@ -130,10 +128,10 @@ llama-server \
   --model          ~/qwen3_5_server/models/Qwen3.5-9B-UD-Q4_K_XL.gguf \
   --host           127.0.0.1 \
   --port           8080 \
-  --ctx-size       49152 \
+  --ctx-size       55296 \
   --flash-attn     on \
-  --cache-type-k   q8_0 \
-  --cache-type-v   q8_0 \
+  --cache-type-k   f16 \
+  --cache-type-v   f16 \
   --gpu-layers     999 \
   --jinja \
   --reasoning-format deepseek \
@@ -156,10 +154,10 @@ llama-server \
 | `--model` | Path to GGUF | The Unsloth Dynamic 2.0 UD-Q4_K_XL quantization of Qwen 3.5 9B |
 | `--host 127.0.0.1` | Localhost only | Not exposed to the network. Clients connect locally. |
 | `--port 8080` | Default llama.cpp port | OpenAI-compatible API at `/v1/chat/completions` |
-| `--ctx-size 49152` | 48K tokens | Maximum safe context for 8 GB VRAM with Q8_0 KV cache (see VRAM calculation) |
+| `--ctx-size 55296` | 54K tokens | Maximum context for 8 GB VRAM with FP16 KV cache, leaving ~144 MB headroom (see VRAM calculation) |
 | `--flash-attn on` | Enabled | Reduces VRAM usage and increases throughput for the 8 full-attention layers. Explicitly `on` instead of `auto` to fail loudly if unsupported. |
-| `--cache-type-k q8_0` | Q8_0 quantized keys | 2x context capacity versus FP16 default, with negligible quality loss. Safe for tool calling (unlike Q4_0). |
-| `--cache-type-v q8_0` | Q8_0 quantized values | Same rationale as keys |
+| `--cache-type-k f16` | FP16 keys (default) | Full precision. KV cache quantization (Q8_0, Q4_0) degrades quality and stability for tool calling and long agentic flows. |
+| `--cache-type-v f16` | FP16 values (default) | Same rationale as keys |
 | `--gpu-layers 999` | Offload all 32 layers to GPU | Forces full GPU offload. Model is 5.97 GB — fits entirely in 8 GB VRAM. Using a large number instead of `auto` to prevent silent CPU fallback. |
 | `--jinja` | Enabled (default) | Required for tool calling. Processes the Jinja2 chat template embedded in the GGUF file. This is the template from the official Qwen 3.5 model — it handles the Qwen3-Coder XML tool calling format, thinking blocks, and multi-turn conversation management. Explicitly specified even though it's the default, because tool calling completely breaks without it. |
 | `--reasoning-format deepseek` | Extract thinking | Parses `<think>...</think>` blocks from model output and returns them in the `reasoning_content` field of the OpenAI-compatible response. Named "deepseek" after the format popularized by DeepSeek R1, but applies to any model using `<think>` tags including Qwen 3.5. The alternative `auto` would also work — it auto-detects. Explicitly set for deterministic behavior. |
@@ -238,20 +236,30 @@ llama.cpp avoids all of these by executing the model's own Jinja2 chat template 
 ## Setup
 
 ```bash
-bash ~/qwen3_5_server/setup.sh
+bash ~/rtx2060_super_setup/qwen3_5_server/setup.sh
 ```
 
-The setup script:
+The script is **idempotent** — safe to run multiple times:
 
-1. Validates all system prerequisites (GPU, CUDA, cmake, disk space) with fatal assertions
-2. Clones llama.cpp at the pinned tag `b8377`
-3. Builds `llama-server` with CUDA support targeting compute capability 7.5 (Turing / RTX 2060 SUPER)
-4. Downloads the Unsloth UD-Q4_K_XL GGUF (5.97 GB) with size validation
-5. Creates a systemd user service at `~/.config/systemd/user/llama-server.service`
-6. Enables and starts the service
-7. Runs a health check against the API
+- Detects existing llama.cpp clone and only rebuilds if the pinned tag has changed
+- Skips the 5.97 GB GGUF download if the correct file already exists (validated by size + GGUF magic number)
+- Re-downloads automatically if the file is corrupt, truncated, or the wrong size
+- Downloads to a `.tmp` file first and validates before moving into place (no partial files left behind)
+- Always regenerates the systemd service file (cheap, ensures config is up to date)
+- Stops the service before making changes, restarts after
 
-The script runs as your regular user (not root). It uses `systemctl --user` for the service.
+**Steps:**
+
+1. Validates all system prerequisites (GPU, CUDA, cmake, disk space, lingering) with fatal assertions
+2. Stops existing service if running
+3. Clones llama.cpp at the pinned tag `b8377` (or validates existing clone is at the correct tag; removes and re-clones if tag changed)
+4. Builds `llama-server` with CUDA support targeting compute capability 7.5 (Turing / RTX 2060 SUPER)
+5. Downloads the Unsloth UD-Q4_K_XL GGUF (5.97 GB) with size and magic number validation
+6. Creates a systemd user service at `~/.config/systemd/user/llama-server.service`
+7. Enables and starts the service
+8. Runs a health check against the API
+
+The script runs as your regular user (not root). It uses `systemctl --user` for the service. Systemd user lingering must be enabled beforehand (see the [main README](../README.md#step-5-enable-systemd-user-lingering)).
 
 ---
 

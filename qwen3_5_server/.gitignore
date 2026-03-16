@@ -1,0 +1,5 @@
+# llama.cpp build (cloned and built by setup.sh)
+/llama.cpp/
+
+# Downloaded GGUF model files (~6 GB)
+/models/

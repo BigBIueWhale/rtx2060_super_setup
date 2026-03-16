@@ -33,7 +33,9 @@ Every external dependency is pinned to a specific version or commit hash. No flo
 
 ### Qwen 3.5 9B
 
-Qwen 3.5 is a **hybrid architecture** combining 24 Gated DeltaNet (GDN) recurrent layers with 8 standard full-attention layers (`full_attention_interval=4`). The recurrent layers use a fixed-size state (not a per-token KV cache), which means only the 8 full-attention layers allocate KV cache that grows with context length. This gives Qwen 3.5 roughly **4x the context capacity** of a standard 32-layer transformer on the same VRAM budget.
+Qwen 3.5 is natively a **unified vision-language model** — it was trained with early fusion on text, images, and video. However, the GGUF file we use (`Qwen3.5-9B-UD-Q4_K_XL.gguf`) contains **only the text/language model weights**. The CLIP vision encoder (~900+ MB) is shipped as a separate file in Unsloth's HuggingFace repository and is not downloaded or loaded. This is a deliberate choice: vision is not needed for agentic coding flows, and the saved VRAM is better spent on context length. To add vision support, you would need to download the separate `mmproj` file and pass `--mmproj <path>` to `llama-server`.
+
+Qwen 3.5 is a **hybrid architecture** combining 24 Gated DeltaNet (GDN) recurrent layers with 8 standard full-attention layers (`full_attention_interval=4`). The recurrent layers use a fixed-size state (not a per-token KV cache), which means only the 8 full-attention layers allocate KV cache that grows with context length.
 
 Qwen 3.5 is a **thinking model** by default. It generates reasoning inside `<think>...</think>` tags before producing its response. Unlike Qwen 3, Qwen 3.5 does **not** support `/think` and `/nothink` soft switches in user messages. Thinking is controlled only via the `enable_thinking` template parameter.
 
@@ -80,40 +82,45 @@ The UD-Q4_K_XL is 5.97 GB versus 5.68 GB for Q4_K_M — a 0.29 GB increase that 
 
 ---
 
-## VRAM Calculation
+## VRAM Layout (Observed)
 
-### Model Weights
+The following VRAM breakdown is from **actual llama.cpp log output** on the RTX 2060 SUPER, not theoretical estimates. The numbers come from `journalctl --user -u llama-server` at startup.
 
-| Component | VRAM |
-|---|---|
-| Model weights (UD-Q4_K_XL GGUF) | 5,970 MB (5.97 GB) |
-| CUDA context + compute buffers | ~300 MB |
-| Recurrent state (24 GDN layers, fixed size) | ~50 MB |
-| **Total fixed cost** | **~6,320 MB** |
-| **Available for KV cache** | **~1,872 MB** |
+### Allocation at Startup (55,296 context, FP16 KV cache)
 
-### KV Cache Cost Per Token
+| Component | VRAM | Source |
+|---|---|---|
+| Model weights (UD-Q4_K_XL GGUF, text-only, no vision encoder) | ~5,540 MiB | GGUF tensor data loaded to GPU |
+| KV cache (8 full-attention layers, FP16) | 1,728 MiB | `llama_kv_cache: CUDA0 KV buffer size = 1728.00 MiB` (55,296 cells, 8 layers, K f16: 864 MiB, V f16: 864 MiB) |
+| Recurrent state (24 GDN layers, F32) | 201 MiB | `llama_memory_recurrent: CUDA0 RS buffer size = 201.00 MiB` (R f32: 9 MiB, S f32: 192 MiB) |
+| Compute graph buffers | ~172 MiB | Allocated by `sched_reserve` for fused Gated Delta Net (autoregressive + chunked) |
+| CUDA output buffer (host-pinned) | ~4 MiB | `llama_context: CUDA_Host output buffer size = 3.79 MiB` |
+| **Total at idle** | **7,661 MiB** | Observed via `nvidia-smi` |
+| **Free at idle** | **531 MiB** | 8,192 - 7,661 |
 
-Only the **8 full-attention layers** allocate per-token KV cache. Each layer stores K and V tensors:
+### Under Full Load (53,512 prompt tokens processed)
 
-```
-Per layer per token: 4 KV-heads x 256 head_dim x 2 (K + V) = 2,048 elements
-8 layers total: 2,048 x 8 = 16,384 elements per token
-```
+| Metric | Idle | Under Load |
+|---|---|---|
+| VRAM used | 7,661 MiB | 7,681 MiB |
+| VRAM free | 531 MiB | 511 MiB |
+| GPU utilization | 0% | 100% |
+| Power draw | 18W | ~174W (TDP: 175W) |
+| Temperature | 36°C | 52°C |
 
-| KV Cache Type | Bytes per Element | Bytes per Token (8 layers) | Max Context (in ~1,872 MB) |
-|---|---|---|---|
-| **FP16 (chosen)** | **2.0** | **32,768 (~32 KB)** | **~59,900 tokens** |
-| Q8_0 | 1.0625 | 17,408 (~17 KB) | ~112,800 tokens |
-| Q4_0 | 0.5625 | 9,216 (~9 KB) | ~213,300 tokens |
+The KV cache is **pre-allocated at startup** for the full context size. Under load, VRAM increases by only ~20 MiB for temporary compute buffers. The 511 MiB free under full load is real, stable headroom.
 
-**KV cache quantization is not used.** Quantizing the KV cache (Q8_0 or Q4_0) yields unacceptable quality and stability decreases for long agentic coding flows. The llama.cpp documentation itself warns about degraded tool calling performance with quantized KV caches. FP16 is the only acceptable option for production use.
+### Why Not a Larger Context?
 
-### Chosen Context Size: 55,296 tokens (54K)
+We empirically tested higher context sizes. At 61,440 tokens (60K), llama.cpp fails with `cudaMalloc failed: out of memory` when attempting to allocate 493 MiB for compute graph buffers — the KV cache at 1,920 MiB plus model weights plus recurrent state leaves insufficient room. At 65,536 tokens (64K), the same failure occurs. **55,296 is the empirically verified maximum** for this model on 8 GB VRAM with FP16 KV cache.
 
-With FP16 KV cache, 55,296 tokens uses approximately **1,728 MB** of the available ~1,872 MB, leaving ~**144 MB** for batch processing buffers, flash attention workspace, and other runtime allocations. This uses nearly the full 8,192 MiB of VRAM on the RTX 2060 SUPER.
+### KV Cache Quantization: Not Used
 
-**Note:** The Qwen 3.5 model card recommends a minimum of 128K context "to preserve thinking capabilities." This is not achievable on 8 GB VRAM with the 9B model at FP16 KV cache. The 54K context is a hardware-imposed trade-off. Thinking mode still works at 54K — the recommendation is about quality at the upper end of deep reasoning chains, not a hard functional requirement.
+Quantizing the KV cache (Q8_0 or Q4_0) would allow larger context but yields unacceptable quality and stability decreases for long agentic coding flows. The llama.cpp documentation itself warns: *"Beware of extreme KV quantizations (e.g. `-ctk q4_0`), they can substantially degrade the model's tool calling performance."* FP16 is the only acceptable option for production use.
+
+### Context Size vs. Model Card Recommendation
+
+The Qwen 3.5 model card recommends a minimum of 128K context "to preserve thinking capabilities." This is not achievable on 8 GB VRAM with the 9B model at FP16 KV cache. The 54K context is a hardware-imposed trade-off. Thinking mode still works at 54K — the recommendation is about quality at the upper end of deep reasoning chains, not a hard functional requirement.
 
 ---
 
@@ -154,11 +161,11 @@ llama-server \
 | `--model` | Path to GGUF | The Unsloth Dynamic 2.0 UD-Q4_K_XL quantization of Qwen 3.5 9B |
 | `--host 127.0.0.1` | Localhost only | Not exposed to the network. Clients connect locally. |
 | `--port 8080` | Default llama.cpp port | OpenAI-compatible API at `/v1/chat/completions` |
-| `--ctx-size 55296` | 54K tokens | Maximum context for 8 GB VRAM with FP16 KV cache, leaving ~144 MB headroom (see VRAM calculation) |
+| `--ctx-size 55296` | 54K tokens | Empirically verified maximum for 8 GB VRAM with FP16 KV cache. Uses 7,661 MiB at idle, 7,681 MiB under load, leaving 511 MiB free. Higher values (60K, 64K) cause OOM at startup. See VRAM layout. |
 | `--flash-attn on` | Enabled | Reduces VRAM usage and increases throughput for the 8 full-attention layers. Explicitly `on` instead of `auto` to fail loudly if unsupported. |
 | `--cache-type-k f16` | FP16 keys (default) | Full precision. KV cache quantization (Q8_0, Q4_0) degrades quality and stability for tool calling and long agentic flows. |
 | `--cache-type-v f16` | FP16 values (default) | Same rationale as keys |
-| `--gpu-layers 999` | Offload all 32 layers to GPU | Forces full GPU offload. Model is 5.97 GB — fits entirely in 8 GB VRAM. Using a large number instead of `auto` to prevent silent CPU fallback. |
+| `--gpu-layers 999` | Offload all 32 layers to GPU | Forces full GPU offload. The text-only GGUF is ~5.5 GB of tensor data — fits entirely in 8 GB VRAM. Using a large number instead of `auto` to prevent silent CPU fallback. |
 | `--jinja` | Enabled (default) | Required for tool calling. Processes the Jinja2 chat template embedded in the GGUF file. This is the template from the official Qwen 3.5 model — it handles the Qwen3-Coder XML tool calling format, thinking blocks, and multi-turn conversation management. Explicitly specified even though it's the default, because tool calling completely breaks without it. |
 | `--reasoning-format deepseek` | Extract thinking | Parses `<think>...</think>` blocks from model output and returns them in the `reasoning_content` field of the OpenAI-compatible response. Named "deepseek" after the format popularized by DeepSeek R1, but applies to any model using `<think>` tags including Qwen 3.5. The alternative `auto` would also work — it auto-detects. Explicitly set for deterministic behavior. |
 | `--reasoning-budget -1` | Unrestricted | No limit on thinking token budget. The model decides when to stop reasoning. `-1` means unlimited. |
